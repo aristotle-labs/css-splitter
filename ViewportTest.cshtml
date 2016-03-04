@@ -1,0 +1,210 @@
+﻿@using ExCSS
+@using System.Text.RegularExpressions
+@using System.Web.Helpers
+@inherits Umbraco.Web.Macros.PartialViewMacroPage
+
+@{
+    var overWriteCSSFiles = Request.IsLocal && false; //Really overwrite?
+    var atfCSSPath = "/css/atf.css";
+    var btfCSSPath = "/css/btf.css";
+    var cssParser = new Parser();
+    var atf = cssParser.Parse(System.IO.File.ReadAllText(Server.MapPath(atfCSSPath)));
+    var btf = cssParser.Parse(System.IO.File.ReadAllText(Server.MapPath(btfCSSPath)));
+    
+    //Let's start by consolidating our media directives.
+    btf.MediaDirectives.ForEach(item =>
+        {
+            item.Condition = Regex.Replace(Regex.Replace(item.Condition, @"(\([^\)]+\:) +([^\)]+\))", "$1$2"), " {2,}", " ");
+        });
+
+    var btfMediaConditionsRefined = btf.MediaDirectives.Select(item => item.Condition).Distinct().ToList();
+
+    btfMediaConditionsRefined.ForEach(item =>
+    {
+        var allDirectives = btf.MediaDirectives.Where(item2 => item2.Condition == item);
+        var lastDirective = allDirectives.Last();
+        var allOtherDirectives = allDirectives.Where(item2 => item2 != lastDirective);
+        
+        if(allOtherDirectives.Any())
+        {
+            lastDirective.RuleSets.InsertRange(0, allOtherDirectives.SelectMany(item2 => item2.RuleSets));
+            
+            allOtherDirectives.ForEach(item2 => {
+                btf.Rules.Remove(item2);
+            });
+        }
+    });
+    
+    if(Request.HttpMethod == "POST" && Request.InputStream.Length > 0)
+    {
+        using(var srTemp = new StreamReader(Request.InputStream))
+        {
+            var content = srTemp.ReadToEnd();
+            var contentJSON = Json.Decode(content);
+            var atfSelectors = ((DynamicJsonArray)((dynamic)contentJSON).atfSelectors).Cast<string>().ToList();
+            var mediaSelectors = ((Dictionary<string, object>)((dynamic)contentJSON).mediaSelectors);
+            var stylesForATF = btf.StyleRules.Where(item => atfSelectors.Contains(item.Selector.ToString()));
+            //var atfBuilder = new StringBuilder();
+
+            atf.Rules.AddRange(stylesForATF);
+            stylesForATF.ForEach(item => btf.Rules.Remove(item));
+
+            mediaSelectors.ForEach(item2 =>
+            {
+                atfSelectors = ((DynamicJsonArray)item2.Value).Cast<string>().ToList();
+                stylesForATF = btf.MediaDirectives.Where(item => item.Condition == item2.Key).SelectMany(item => item.RuleSets).Where(item => item is StyleRule).Select(item => (StyleRule)item).Where(item => atfSelectors.Contains(item.Selector.ToString())).ToList();
+
+                if (!atf.MediaDirectives.Any(item => item.Condition == item2.Key))
+                {
+                    var newMediaRule = new MediaRule()
+                    {
+                       Condition = item2.Key,
+                       RuleType = btf.MediaDirectives.First(item => item.Condition == item2.Key).RuleType
+                    };
+                    
+                    atf.Rules.Add(newMediaRule);
+                }
+
+                atf.MediaDirectives.First(item => item.Condition == item2.Key).RuleSets.AddRange(stylesForATF);
+                stylesForATF.ForEach(item =>
+                {
+                    btf.MediaDirectives.First(item3 => item3.Condition == item2.Key).RuleSets.Remove(item);
+                });
+            });
+
+            btf.MediaDirectives.Where(item => item.RuleSets.Count == 0).ToList().ForEach(item =>
+            {
+                btf.Rules.Remove(item);
+            });
+            
+            if(overWriteCSSFiles)
+            {
+                System.IO.File.WriteAllText(Server.MapPath(atfCSSPath), atf.ToString(true));
+                System.IO.File.WriteAllText(Server.MapPath(btfCSSPath), btf.ToString(true));
+            }
+
+            Response.ContentType = "text/css";
+            Response.Write("/*atf.css*/\r\n" + atf.ToString(true) + "\r\n\r\n/*btf.css*/\r\n" + btf.ToString(true));
+            Response.Flush();
+            Response.End();
+        }
+    }
+
+    var cssObject = new { nonMediaRuleSelectors = btf.StyleRules.Select(item => item.Selector.ToString()).ToArray(), mediaRuleSelectors = btf.MediaDirectives.Where(item => !Regex.IsMatch(item.Condition, "^print$", RegexOptions.IgnoreCase)).Select(item => new { mediaConditionString = item.Condition, mediaConditions = item.Condition.Replace("(", "").Replace(")", "").Split(new string[] { " and " }, StringSplitOptions.RemoveEmptyEntries), selectors = item.RuleSets.Where(item2 => item2 is StyleRule).Select(item2 => ((StyleRule)item2).Selector.ToString()).ToArray() }).ToArray() };
+    var cssJson = Json.Encode(cssObject);
+
+    cssJson.ToString();
+}
+
+<script type="text/javascript">
+    $(document).ready(function(){
+        $("iframe#viewport_test").width($(window).width()).height($(window).height());
+        $("iframe#viewport_test").load(function(){
+            var cssJson = @Html.Raw(cssJson);
+            var atfSelectors = new Array();
+            var mediaSelectors = new Object();
+            var benchmark = $(this.contentWindow.document).find(".events-calendar").offset().top;
+
+            for(i=0; i < cssJson.nonMediaRuleSelectors.length; i++)
+            {
+                try
+                {
+                    var isATF = false;
+
+                    $(this.contentWindow.document).find(cssJson.nonMediaRuleSelectors[i]).each(function(){
+                        if(!isATF && $(this).css("display") != "none" && $(this).css("visibility") != "hidden")
+                        {
+                            if($(this).offset().top < benchmark)
+                                isATF = true;
+                            else
+                                $(this).find("*").each(function(){
+                                    if(!isATF && $(this).css("display") != "none" && $(this).css("visibility") != "hidden" && $(this).offset().top < benchmark)
+                                        isATF = true;
+                                });
+                        }
+                    });
+
+                    if(isATF)
+                        atfSelectors[atfSelectors.length] = cssJson.nonMediaRuleSelectors[i];
+                }
+                catch(exc)
+                {}
+            }
+            for(j=0; j < cssJson.mediaRuleSelectors.length; j++)
+            {
+                var frameWidth = $(window).width();
+                var frameHeight = $(window).height();
+
+                for(i=0;i<cssJson.mediaRuleSelectors[j].mediaConditions.length;i++)
+                {
+                    var condition = cssJson.mediaRuleSelectors[j].mediaConditions[i];
+                    
+                    if(condition.match(/^m(ax|in)\-width\:([0-9]+)px$/i))
+                    {
+                        var newWidth = eval(condition.replace(/^m(ax|in)\-width\:([0-9]+)px$/i, "$2"));
+                        var newHeight = frameHeight * newWidth / frameWidth;
+
+                        frameWidth = newWidth;
+                        frameHeight = newHeight;
+                    }
+                    else if(condition.match(/^m(ax|in)\-height\:([0-9]+)px$/i))
+                    {
+                        var newHeight = eval(condition.replace(/^m(ax|in)\-height\:([0-9]+)px$/i, "$2"));
+                        var newWidth = frameWidth * newHeight / frameHeight;
+
+                        frameWidth = newWidth;
+                        frameHeight = newHeight;
+                    }
+                    //No need for landscape; the default is landscape.
+                    else if(condition.match(/^orientation:portrait$/i) && frameWidth > frameHeight)
+                    {
+                        var newWidth = frameHeight;
+                        var newHeight = frameWidth;
+
+                        frameWidth = newWidth;
+                        frameHeight = newHeight;
+                    }
+                }
+
+                $("iframe#viewport_test").width(frameWidth).height(frameHeight);
+                benchmark = $(this.contentWindow.document).find(".events-calendar").offset().top;
+
+                for(i=0; i < cssJson.mediaRuleSelectors[j].selectors.length; i++)
+                {
+                    try
+                    {
+                        var isATF = false;
+
+                        $(this.contentWindow.document).find(cssJson.mediaRuleSelectors[j].selectors[i]).each(function(){
+                            if(!isATF && $(this).css("display") != "none" && $(this).css("visibility") != "hidden")
+                            {
+                                if($(this).offset().top < benchmark)
+                                    isATF = true;
+                                else
+                                    $(this).find("*").each(function(){
+                                        if(!isATF && $(this).css("display") != "none" && $(this).css("visibility") != "hidden" && $(this).offset().top < benchmark)
+                                            isATF = true;
+                                    });
+                            }
+                        });
+
+                        if(isATF)
+                        {
+                            if(mediaSelectors[cssJson.mediaRuleSelectors[j].mediaConditionString] == undefined)
+                                mediaSelectors[cssJson.mediaRuleSelectors[j].mediaConditionString] = new Array();
+
+                            mediaSelectors[cssJson.mediaRuleSelectors[j].mediaConditionString][mediaSelectors[cssJson.mediaRuleSelectors[j].mediaConditionString].length] = cssJson.mediaRuleSelectors[j].selectors[i];
+                        }
+                    }
+                    catch(exc)
+                    {}
+                }
+            }
+            $.post("@Request.Path", JSON.stringify({ "mediaSelectors": mediaSelectors, "atfSelectors": atfSelectors}), function(data){
+                console.log(data);
+            });
+        });
+    });
+</script>
+
+<iframe src="/" width="375" height="627" id="viewport_test" frameborder="0"></iframe>
